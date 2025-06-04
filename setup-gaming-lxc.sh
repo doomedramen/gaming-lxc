@@ -1,6 +1,16 @@
 #!/bin/bash
 # Gaming LXC Setup Script for Proxmox
 # Based on the complete guide in README.md
+#
+# IMPORTANT FIXES INCLUDED (discovered during troubleshooting):
+# - Sunshine v0.23.1 (stable) - avoids FFmpeg 7.1 segmentation fault with AMD GPUs
+# - GPU driver packages: mesa-opencl-icd, ocl-icd-libopencl1, clinfo for AMD compatibility
+# - VAAPI configuration: encoder=vaapi, adapter_name=/dev/dri/renderD128, sw_preset=medium
+# - Network configuration: address_family=ipv4 for proper IPv4 binding
+# - LightDM default display manager fix: /etc/X11/default-display-manager = /usr/sbin/lightdm
+# - Firewall ports: UDP 47998-48000 range for complete Moonlight compatibility
+# - Systemd service: pre-created runtime directories and CAP_SYS_ADMIN capability
+# - Container capabilities: lxc.cap.keep: sys_admin for Sunshine compatibility
 
 set -e  # Exit on any error
 
@@ -311,8 +321,9 @@ lxc.cgroup2.devices.allow: c 10:223 rwm
 lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir
 lxc.mount.entry: /dev/fb0 dev/fb0 none bind,optional,create=file
 lxc.mount.entry: /dev/uinput dev/uinput none bind,optional,create=file
+lxc.cap.keep: sys_admin
 EOF
-        print_step "Added GPU passthrough configuration"
+        print_step "Added GPU passthrough configuration with CAP_SYS_ADMIN capability"
     else
         print_warning "GPU passthrough already configured for container $CTID"
     fi
@@ -347,7 +358,7 @@ setup_container_system() {
     print_step "Installing GPU drivers and graphics libraries"
     pct exec "$CTID" -- apt install -y mesa-utils mesa-vulkan-drivers \
         libgl1-mesa-dri libglx-mesa0 libgl1-mesa-glx \
-        vulkan-tools
+        vulkan-tools mesa-opencl-icd ocl-icd-libopencl1 clinfo
     
     print_step "Enabling 32-bit architecture for Steam"
     pct exec "$CTID" -- bash -c "dpkg --add-architecture i386 && apt update"
@@ -410,9 +421,11 @@ EOF
         
         # Set password
         pct exec "$CTID" -- bash -c "echo 'gamer:$GAMER_PASSWORD' | chpasswd"
-        print_step "Created gamer user"
+        print_step "Created gamer user with input device access"
     else
         print_warning "Gamer user already exists"
+        # Ensure user is in input group
+        pct exec "$CTID" -- usermod -aG input gamer
     fi
     
     print_step "Configuring auto-login"
@@ -431,6 +444,11 @@ EOF
     rm /tmp/lightdm.conf
     
     pct exec "$CTID" -- usermod -aG nopasswdlogin gamer
+    
+    # Fix LightDM default display manager (critical for container compatibility)
+    print_step "Setting LightDM as default display manager"
+    pct exec "$CTID" -- bash -c "echo '/usr/sbin/lightdm' > /etc/X11/default-display-manager"
+    
     pct exec "$CTID" -- systemctl enable lightdm
 }
 
@@ -497,22 +515,42 @@ install_gaming_software() {
     pct exec "$CTID" -- apt install -y libc6:i386 libegl1:i386 libgbm1:i386 \
         libgl1-mesa-dri:i386 libgl1:i386 steam-installer
     
+    print_step "Installing Sunshine dependencies"
+    
+    # Install required dependencies first
+    pct exec "$CTID" -- apt install -y libva2 libva-drm2 libva-glx2 libva-wayland2 \
+        miniupnpc libminiupnpc17 vainfo intel-media-va-driver-non-free \
+        mesa-va-drivers libdrm-amdgpu1 libdrm-radeon1
+    
     print_step "Installing Sunshine game streaming server"
     
-    # Try repository method first
-    if pct exec "$CTID" -- bash -c "curl -fsSL https://apt.fury.io/LizardByte/gpg.key | gpg --dearmor -o /usr/share/keyrings/lizardbyte.gpg" && \
-       pct exec "$CTID" -- bash -c 'echo "deb [signed-by=/usr/share/keyrings/lizardbyte.gpg] https://apt.fury.io/LizardByte/ * *" | tee /etc/apt/sources.list.d/lizardbyte.list' && \
-       pct exec "$CTID" -- apt update && \
-       pct exec "$CTID" -- apt install -y sunshine; then
-        print_step "Sunshine installed via repository"
-    else
-        print_warning "Repository installation failed, trying direct download"
+    # Install stable version v0.23.1 to avoid FFmpeg 7.1 segmentation fault bug with AMD GPUs
+    print_step "Installing Sunshine v0.23.1 (stable version for AMD compatibility)"
+    pct exec "$CTID" -- bash -c "
+        # Install dependencies first
+        apt install -y libva2 libva-drm2 miniupnpc libminiupnpc17 &&
+        # Download and install specific stable version
+        wget -q https://github.com/LizardByte/Sunshine/releases/download/v0.23.1/sunshine-ubuntu-22.04-amd64.deb -O /tmp/sunshine.deb &&
+        dpkg -i /tmp/sunshine.deb &&
+        apt-get install -f -y &&
+        rm /tmp/sunshine.deb
+    " || {
+        print_error "Failed to install Sunshine v0.23.1. Attempting manual dependency resolution..."
         pct exec "$CTID" -- bash -c "
-            wget -q https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-ubuntu-22.04-amd64.deb -O /tmp/sunshine.deb &&
-            dpkg -i /tmp/sunshine.deb &&
-            apt-get install -f -y &&
-            rm /tmp/sunshine.deb
+            apt update &&
+            apt install -y --fix-broken &&
+            apt install -y libva2 libva-drm2 miniupnpc libminiupnpc17 &&
+            wget -q https://github.com/LizardByte/Sunshine/releases/download/v0.23.1/sunshine-ubuntu-22.04-amd64.deb -O /tmp/sunshine.deb &&
+            dpkg -i /tmp/sunshine.deb || apt-get install -f -y &&
+            rm -f /tmp/sunshine.deb
         "
+    }
+    
+    # Verify Sunshine installation
+    if pct exec "$CTID" -- which sunshine &>/dev/null; then
+        print_step "Sunshine installation verified"
+    else
+        print_error "Sunshine installation failed. Continuing with setup..."
     fi
     
     print_step "Configuring Sunshine"
@@ -526,20 +564,17 @@ upnp = on
 min_log_level = info
 file_apps = /home/gamer/.config/sunshine/apps.json
 
-# Video settings - optimized for AMD hardware encoding
-encoder = amdvce
-bitrate = 20000
-fps = 60
-min_threads = 2
+# Network settings - force IPv4 for proper Moonlight connectivity
+address_family = ipv4
+port = 47989
+
+# Video settings - use VAAPI hardware encoding (stable with v0.23.1)
+encoder = vaapi
+adapter_name = /dev/dri/renderD128
+sw_preset = medium
 
 # Audio settings
 audio_sink = pulse
-virtual_sink = sunshine-audio
-
-# Network settings
-address_family = both
-channels = 5
-port = 47989
 EOF
     
     pct push "$CTID" /tmp/sunshine.conf /home/gamer/.config/sunshine/sunshine.conf
@@ -590,6 +625,12 @@ setup_services() {
     print_header "PHASE 7: SERVICE CONFIGURATION"
     
     print_step "Creating Sunshine systemd service"
+    
+    # Create runtime directory as root first to avoid permission issues
+    pct exec "$CTID" -- mkdir -p /run/user/1000
+    pct exec "$CTID" -- chown gamer:gamer /run/user/1000
+    pct exec "$CTID" -- chmod 755 /run/user/1000
+    
     cat > /tmp/sunshine.service << 'EOF'
 [Unit]
 Description=Sunshine Game Streaming Server
@@ -600,72 +641,37 @@ Wants=graphical.target
 Type=simple
 User=gamer
 Group=gamer
-RuntimeDirectory=sunshine
-RuntimeDirectoryMode=0755
-RuntimeDirectoryPreserve=yes
-StateDirectory=sunshine
-StateDirectoryMode=0755
-LogsDirectory=sunshine
-LogsDirectoryMode=0755
+SupplementaryGroups=video audio render input
 
-# Core environment
+# Environment
 Environment=HOME=/home/gamer
 Environment=USER=gamer
 Environment=DISPLAY=:0
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=XDG_SESSION_TYPE=x11
-Environment=XDG_SESSION_CLASS=user
-
-# Audio environment
 Environment=PULSE_RUNTIME_PATH=/run/user/1000/pulse
-Environment=PULSE_STATE_PATH=/home/gamer/.config/pulse
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 
-# Graphics environment
+# Graphics
 Environment=DRI_PRIME=1
 Environment=LIBVA_DRIVER_NAME=radeonsi
 Environment=MESA_LOADER_DRIVER_OVERRIDE=radeonsi
 
-# Sunshine specific
-Environment=SUNSHINE_CONFIG_DIR=/home/gamer/.config/sunshine
+# Setup directories with proper permissions
+ExecStartPre=/bin/bash -c 'mkdir -p /run/user/1000/{pulse,dbus-1} || true'
+ExecStartPre=/bin/bash -c 'mkdir -p /home/gamer/.config/{sunshine,pulse} || true'
 
-# Setup runtime directories and permissions
-ExecStartPre=/bin/bash -c 'mkdir -p /run/user/1000/{pulse,dbus-1} /home/gamer/.config/{sunshine,pulse}'
-ExecStartPre=/bin/bash -c 'chown -R gamer:gamer /run/user/1000 /home/gamer/.config'
-ExecStartPre=/bin/bash -c 'chmod 755 /run/user/1000'
+# Start PulseAudio if needed
+ExecStartPre=/bin/bash -c 'if ! pgrep -u gamer pulseaudio >/dev/null; then runuser -u gamer -- pulseaudio --start || true; fi'
 
-# Start PulseAudio if not running
-ExecStartPre=/bin/bash -c 'if ! pgrep -u gamer pulseaudio >/dev/null; then runuser -u gamer -- pulseaudio --start --log-target=journal; fi'
-
-# Verify GPU access before starting
-ExecStartPre=/bin/bash -c 'test -r /dev/dri/renderD128 || exit 1'
-
+# Main command
 ExecStart=/usr/bin/sunshine
-ExecReload=/bin/kill -HUP $MAINPID
 
-# Restart configuration
+# Restart
 Restart=on-failure
 RestartSec=10
-StartLimitInterval=300
-StartLimitBurst=5
-
-# Process management
 KillMode=mixed
-KillSignal=SIGTERM
 TimeoutStopSec=30
-
-# Security and resource limits
-NoNewPrivileges=true
-ProtectHome=read-only
-ProtectSystem=strict
-ReadWritePaths=/home/gamer/.config /run/user/1000 /var/lib/sunshine /var/log/sunshine /tmp
-PrivateTmp=true
-RemoveIPC=true
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=sunshine
 
 [Install]
 WantedBy=multi-user.target
@@ -737,16 +743,117 @@ setup_network() {
     print_step "Configuring container firewall"
     pct exec "$CTID" -- apt install -y ufw
     
-    # Allow Sunshine ports
+    # Allow Sunshine ports (expanded range to include 47998-48000 for Moonlight compatibility)
     pct exec "$CTID" -- ufw allow 47984:47990/tcp
     pct exec "$CTID" -- ufw allow 47984:47990/udp
+    pct exec "$CTID" -- ufw allow 47998:48000/udp
     pct exec "$CTID" -- ufw allow 48010/tcp
     
     pct exec "$CTID" -- ufw --force enable
 }
 
+test_configuration() {
+    print_header "PHASE 9: TESTING CONFIGURATION"
+    
+    print_step "Testing GPU access"
+    if pct exec "$CTID" -- su - gamer -c "ls -la /dev/dri/renderD128" 2>/dev/null; then
+        print_step "✓ GPU device accessible"
+    else
+        print_error "✗ GPU device not accessible"
+        return 1
+    fi
+    
+    print_step "Testing VAAPI hardware encoding"
+    if pct exec "$CTID" -- su - gamer -c "vainfo --display drm --device /dev/dri/renderD128" 2>/dev/null | grep -q "VAProfile"; then
+        print_step "✓ VAAPI hardware encoding available"
+    else
+        print_warning "⚠ VAAPI encoding may not be working optimally"
+    fi
+    
+    print_step "Testing Sunshine configuration"
+    if pct exec "$CTID" -- test -f /home/gamer/.config/sunshine/sunshine.conf; then
+        print_step "✓ Sunshine configuration exists"
+    else
+        print_error "✗ Sunshine configuration missing"
+        return 1
+    fi
+    
+    print_step "Starting services for testing"
+    pct exec "$CTID" -- systemctl start sunshine.service
+    sleep 5
+    
+    print_step "Checking Sunshine service status"
+    if pct exec "$CTID" -- systemctl is-active sunshine.service | grep -q "active"; then
+        print_step "✓ Sunshine service is running"
+        
+        # Check if ports are listening
+        if pct exec "$CTID" -- netstat -tlnp 2>/dev/null | grep -q ":47989"; then
+            print_step "✓ Sunshine is listening on port 47989"
+        else
+            print_warning "⚠ Sunshine may not be listening on expected ports"
+        fi
+    else
+        print_error "✗ Sunshine service failed to start"
+        pct exec "$CTID" -- journalctl -u sunshine.service --no-pager -n 20
+        return 1
+    fi
+    
+    print_step "Getting container IP for Moonlight connection"
+    CONTAINER_IP=$(pct exec "$CTID" -- hostname -I | awk '{print $1}')
+    
+    # Final verification checks
+    print_step "Performing final verification checks"
+    
+    # Check LightDM is running
+    if pct exec "$CTID" -- systemctl is-active lightdm | grep -q "active"; then
+        print_step "✓ LightDM display manager is running"
+    else
+        print_warning "⚠ LightDM may not be running properly"
+    fi
+    
+    # Check X server is responding
+    if pct exec "$CTID" -- su - gamer -c "DISPLAY=:0 xset q" >/dev/null 2>&1; then
+        print_step "✓ X server is responding on DISPLAY :0"
+    else
+        print_warning "⚠ X server may not be responding properly"
+    fi
+    
+    # Check firewall configuration
+    if pct exec "$CTID" -- ufw status | grep -q "47998:48000/udp"; then
+        print_step "✓ Firewall configured with all required ports"
+    else
+        print_warning "⚠ Firewall may be missing some required ports"
+    fi
+    
+    print_success "✅ SETUP COMPLETE!"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "📡 MOONLIGHT CONNECTION DETAILS:"
+    echo "   IP Address: $CONTAINER_IP"
+    echo "   Port: 47989"
+    echo "   Username: gamer"
+    echo "   Password: Set during setup"
+    echo ""
+    echo "🎮 TO CONNECT:"
+    echo "   1. Open Moonlight on your client device"
+    echo "   2. Add computer manually: $CONTAINER_IP:47989"
+    echo "   3. Enter the PIN when prompted"
+    echo "   4. Select 'Desktop' or 'Steam Big Picture' to start"
+    echo ""
+    echo "🔧 SUNSHINE WEB UI:"
+    echo "   https://$CONTAINER_IP:47990"
+    echo "   (Accept the self-signed certificate)"
+    echo ""
+    echo "🚨 TROUBLESHOOTING:"
+    echo "   - If Moonlight shows 'Computer is unreachable': Check firewall and network"
+    echo "   - If connection fails on UDP 47999: Restart container and try again"
+    echo "   - If you see black screen: Wait 30 seconds for desktop to load"
+    echo "   - If you see host desktop: Check LightDM status in container"
+    echo "   - Logs: pct exec $CTID -- journalctl -u sunshine -u lightdm"
+    echo "═══════════════════════════════════════════════════════════"
+}
+
 finalize_setup() {
-    print_header "PHASE 9: FINAL SETUP"
+    print_header "PHASE 10: FINAL SETUP"
     
     print_step "Setting final permissions"
     pct exec "$CTID" -- chown -R gamer:gamer /home/gamer
@@ -781,12 +888,89 @@ EOF
     pct exec "$CTID" -- chmod +x /home/gamer/performance-tweaks.sh
     
     print_step "Restarting services"
-    pct exec "$CTID" -- systemctl restart lightdm
-    sleep 5
-    pct exec "$CTID" -- systemctl start sunshine
+    
+    # Check and fix LightDM configuration before starting
+    print_step "Verifying LightDM configuration"
+    pct exec "$CTID" -- bash -c "
+        # Ensure X11 directories exist
+        mkdir -p /tmp/.X11-unix /var/lib/lightdm /var/log/lightdm /var/cache/lightdm
+        chmod 1777 /tmp/.X11-unix
+        chown lightdm:lightdm /var/lib/lightdm /var/log/lightdm /var/cache/lightdm
+        
+        # Verify gamer user exists and has proper groups
+        id gamer || { echo 'User gamer does not exist'; exit 1; }
+        usermod -aG video,audio,render,input,nopasswdlogin gamer
+        
+        # Check if XFCE session file exists
+        ls -la /usr/share/xsessions/ || echo 'No session files found'
+        
+        # Create basic XFCE session if missing
+        if [[ ! -f /usr/share/xsessions/xfce.desktop ]]; then
+            cat > /usr/share/xsessions/xfce.desktop << 'EOF'
+[Desktop Entry]
+Name=Xfce Session
+Comment=Use this session to run Xfce as your desktop environment
+Exec=startxfce4
+Icon=
+Type=Application
+EOF
+        fi
+    "
+    
+    # Try to start LightDM with error handling
+    if pct exec "$CTID" -- systemctl restart lightdm; then
+        print_step "LightDM started successfully"
+        sleep 5
+    else
+        print_warning "LightDM failed to start, checking logs..."
+        
+        # Get LightDM logs for troubleshooting
+        print_step "LightDM status:"
+        pct exec "$CTID" -- systemctl status lightdm --no-pager -l
+        
+        print_step "LightDM logs:"
+        pct exec "$CTID" -- journalctl -u lightdm --no-pager -n 20
+        
+        print_step "X11 logs:"
+        pct exec "$CTID" -- ls -la /var/log/Xorg.* 2>/dev/null || echo "No X11 logs found"
+        pct exec "$CTID" -- tail -n 10 /var/log/Xorg.0.log 2>/dev/null || echo "No Xorg.0.log available"
+        
+        # Try alternative startup approach
+        print_warning "Attempting alternative X11 startup approach..."
+        pct exec "$CTID" -- bash -c "
+            # Create minimal xinitrc for testing
+            cat > /home/gamer/.xinitrc << 'EOF'
+#!/bin/bash
+export DISPLAY=:0
+exec startxfce4
+EOF
+            chmod +x /home/gamer/.xinitrc
+            chown gamer:gamer /home/gamer/.xinitrc
+            
+            # Try to start X manually for testing
+            sudo -u gamer DISPLAY=:0 startx /home/gamer/.xinitrc -- :0 -auth /tmp/serverauth.0 &
+        " || print_warning "Manual X11 startup also failed"
+    fi
+    
+    # Start Sunshine regardless of LightDM status
+    print_step "Starting Sunshine service"
+    if pct exec "$CTID" -- systemctl start sunshine; then
+        print_step "Sunshine started successfully"
+    else
+        print_warning "Sunshine failed to start, checking status..."
+        pct exec "$CTID" -- systemctl status sunshine --no-pager -l
+        pct exec "$CTID" -- journalctl -u sunshine --no-pager -n 10
+    fi
     
     # Get container IP
     CONTAINER_IP=$(pct exec "$CTID" -- hostname -I | awk '{print $1}' 2>/dev/null || echo "IP detection failed")
+    
+    # Final service status check
+    print_step "Final service status check"
+    echo "LightDM status:"
+    pct exec "$CTID" -- systemctl is-active lightdm || echo "  ❌ LightDM not running"
+    echo "Sunshine status:"
+    pct exec "$CTID" -- systemctl is-active sunshine || echo "  ❌ Sunshine not running"
     
     print_header "SETUP COMPLETE!"
     
@@ -806,8 +990,30 @@ EOF
     echo "Check container status: pct status $CTID"
     echo "Enter container: pct enter $CTID"
     echo "Check Sunshine logs: pct exec $CTID -- journalctl -u sunshine -f"
+    echo "Check LightDM logs: pct exec $CTID -- journalctl -u lightdm -f"
     echo "Check display status: pct exec $CTID -- DISPLAY=:0 xrandr"
+    echo "Restart display: pct exec $CTID -- systemctl restart lightdm"
+    echo "Manual X11 test: pct exec $CTID -- sudo -u gamer DISPLAY=:0 xrandr"
     echo
+    
+    # Show troubleshooting info if services failed
+    if ! pct exec "$CTID" -- systemctl is-active lightdm &>/dev/null; then
+        echo -e "${YELLOW}⚠️  LightDM Troubleshooting:${NC}"
+        echo "1. Check X11 configuration: pct exec $CTID -- cat /etc/X11/xorg.conf.d/20-amd.conf"
+        echo "2. Verify GPU access: pct exec $CTID -- ls -la /dev/dri/"
+        echo "3. Check logs: pct exec $CTID -- journalctl -u lightdm -n 50"
+        echo "4. Try manual start: pct exec $CTID -- sudo -u gamer startxfce4"
+        echo
+    fi
+    
+    if ! pct exec "$CTID" -- systemctl is-active sunshine &>/dev/null; then
+        echo -e "${YELLOW}⚠️  Sunshine Troubleshooting:${NC}"
+        echo "1. Check service status: pct exec $CTID -- systemctl status sunshine"
+        echo "2. View logs: pct exec $CTID -- journalctl -u sunshine -n 50"
+        echo "3. Test manual start: pct exec $CTID -- sudo -u gamer DISPLAY=:0 sunshine"
+        echo "4. Verify GPU encoding: pct exec $CTID -- DISPLAY=:0 vainfo"
+        echo
+    fi
     
     # Check if reboot is needed
     current_cmdline=$(cat /proc/cmdline)
@@ -913,6 +1119,7 @@ main() {
     setup_services
     setup_network
     finalize_setup
+    test_configuration
 }
 
 # Run main function with all arguments
